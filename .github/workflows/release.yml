@@ -110,7 +110,7 @@ jobs:
           fetch-tags: true
 
       - name: Apply quota persistence customization
-        run: bash ./apply.sh upstream
+        run: bash customizations-repo/apply.sh upstream
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
