@@ -11,7 +11,7 @@ This directory contains everything needed to apply this project's quota persiste
 ## Local usage
 
 ```bash
-customizations/quota-persistence/apply.sh /path/to/Cli-Proxy-API-Management-Center
+./apply.sh /path/to/Cli-Proxy-API-Management-Center
 ```
 
 From this repository, the local sync wrapper can also be used:
