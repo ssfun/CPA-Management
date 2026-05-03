@@ -1520,12 +1520,6 @@ export function MonitoringCenterPage() {
         </div>
 
         {combinedError ? <div className={styles.errorBox}>{combinedError}</div> : null}
-        {!config?.usageStatisticsEnabled ? (
-          <div className={styles.callout}>
-            <strong>{t('monitoring.usage_disabled_title')}</strong>
-            <span>{t('monitoring.usage_disabled_body')}</span>
-          </div>
-        ) : null}
       </Panel>
 
       <section className={styles.summaryGrid}>
