@@ -142,9 +142,9 @@ def patch_quota_types(target: Path) -> None:
 def patch_quota_configs(target: Path) -> None:
     path = target / 'src/components/quota/quotaConfigs.ts'
     for old, new in [
-        ("    planType: data.planType,\n  }),", "    planType: data.planType,\n    cachedAt: Date.now(),\n  }),"),
+        ("    extraUsage: data.extraUsage,\n    planType: data.planType,\n  }),", "    extraUsage: data.extraUsage,\n    planType: data.planType,\n    cachedAt: Date.now(),\n  }),"),
         ("  buildSuccessState: (groups) => ({ status: 'success', groups }),", "  buildSuccessState: (groups) => ({ status: 'success', groups, cachedAt: Date.now() }),"),
-        ("    planType: data.planType,\n  }),", "    planType: data.planType,\n    cachedAt: Date.now(),\n  }),"),
+        ("    windows: data.windows,\n    planType: data.planType,\n  }),", "    windows: data.windows,\n    planType: data.planType,\n    cachedAt: Date.now(),\n  }),"),
         ("      creditBalance: supplementarySnapshot.creditBalance ?? data.creditBalance,\n    };", "      creditBalance: supplementarySnapshot.creditBalance ?? data.creditBalance,\n      cachedAt: Date.now(),\n    };"),
         ("  buildSuccessState: (rows) => ({ status: 'success', rows }),", "  buildSuccessState: (rows) => ({ status: 'success', rows, cachedAt: Date.now() }),"),
     ]:

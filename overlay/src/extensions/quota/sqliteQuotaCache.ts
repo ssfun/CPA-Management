@@ -51,7 +51,7 @@ class SqliteQuotaCache {
     return result;
   }
 
-  async set(provider: string, fileName: string, data: unknown, cachedAt = Date.now()): Promise<void> {
+  async set(provider: string, fileName: string, data: unknown, cachedAt = Date.now()): Promise<boolean> {
     try {
       await apiClient.put('/usage/quota-cache', {
         provider,
@@ -61,8 +61,10 @@ class SqliteQuotaCache {
         accessedAt: Date.now(),
         version: 1,
       });
+      return true;
     } catch (err) {
       console.error('SQLite quota cache set error:', err);
+      return false;
     }
   }
 

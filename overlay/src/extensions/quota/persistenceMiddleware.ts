@@ -17,7 +17,8 @@ class QuotaPersistenceMiddleware {
   private unsubscribe: (() => void) | null = null;
   private isPreloading = false;
   private syncQueue = new Set<string>();
-  private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  private isFlushing = false;
+  private syncedVersions = new Map<string, number>();
 
   /**
    * Start the middleware
@@ -63,10 +64,7 @@ class QuotaPersistenceMiddleware {
       this.unsubscribe();
       this.unsubscribe = null;
     }
-    if (this.syncTimer) {
-      clearTimeout(this.syncTimer);
-      this.syncTimer = null;
-    }
+    void this.flushSyncQueue();
     console.log('QuotaPersistenceMiddleware: Stopped');
   }
 
@@ -99,55 +97,61 @@ class QuotaPersistenceMiddleware {
   }
 
   /**
-   * Sync provider quota to SQLite quota cache (debounced)
+   * Sync provider quota to SQLite quota cache.
    */
   private syncProvider(
     provider: QuotaProviderType,
     quotaMap: Record<string, QuotaStatusState>
   ) {
     Object.entries(quotaMap).forEach(([fileName, state]) => {
-      if (state.status === 'success' && state.cachedAt) {
-        const key = `${provider}:${fileName}`;
-        this.syncQueue.add(key);
-      }
+      if (state.status !== 'success') return;
+
+      const key = `${provider}:${fileName}`;
+      const version = state.cachedAt ?? 0;
+      if (this.syncedVersions.get(key) === version) return;
+      this.syncQueue.add(key);
     });
 
-    // Debounce: batch sync after 500ms
-    if (this.syncTimer) {
-      clearTimeout(this.syncTimer);
-    }
-    this.syncTimer = setTimeout(() => {
-      this.flushSyncQueue();
-    }, 500);
+    void this.flushSyncQueue();
   }
 
   /**
    * Flush sync queue to SQLite quota cache
    */
   private async flushSyncQueue() {
-    if (this.syncQueue.size === 0) return;
-
-    const state = useQuotaStore.getState();
-    const promises: Promise<void>[] = [];
-
-    this.syncQueue.forEach((key) => {
-      const [provider, fileName] = key.split(':');
-      const quotaMap = this.getQuotaMap(state, provider as QuotaProviderType);
-      const quotaState = quotaMap?.[fileName];
-
-      if (quotaState?.status === 'success' && quotaState.cachedAt) {
-        promises.push(
-          sqliteQuotaCache.set(provider, fileName, quotaState, quotaState.cachedAt)
-        );
-      }
-    });
-
-    this.syncQueue.clear();
+    if (this.isFlushing) return;
+    this.isFlushing = true;
 
     try {
-      await Promise.all(promises);
+      while (this.syncQueue.size > 0) {
+        const key = this.syncQueue.values().next().value as string | undefined;
+        if (!key) break;
+        this.syncQueue.delete(key);
+
+        const separatorIndex = key.indexOf(':');
+        if (separatorIndex <= 0) continue;
+
+        const provider = key.slice(0, separatorIndex) as QuotaProviderType;
+        const fileName = key.slice(separatorIndex + 1);
+        const state = useQuotaStore.getState();
+        const quotaMap = this.getQuotaMap(state, provider);
+        const quotaState = quotaMap?.[fileName];
+
+        if (quotaState?.status !== 'success') continue;
+
+        const cachedAt = quotaState.cachedAt ?? Date.now();
+        const synced = await sqliteQuotaCache.set(provider, fileName, { ...quotaState, cachedAt }, cachedAt);
+        if (synced) {
+          this.syncedVersions.set(key, cachedAt);
+        }
+      }
     } catch (err) {
       console.error('QuotaPersistenceMiddleware: Failed to sync to SQLite quota cache:', err);
+    } finally {
+      this.isFlushing = false;
+      if (this.syncQueue.size > 0) {
+        void this.flushSyncQueue();
+      }
     }
   }
 
