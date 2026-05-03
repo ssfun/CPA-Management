@@ -4,7 +4,7 @@ import { apiClient } from '@/services/api/client';
 import type { AuthFileItem } from '@/types/authFile';
 import type { Config } from '@/types/config';
 import type { CredentialInfo } from '@/types/sourceInfo';
-import { buildSourceInfoMap, resolveSourceDisplay } from '@/utils/sourceResolver';
+import { buildSourceInfoMap, resolveSourceDisplay, type SourceInfoMapInput } from '@/utils/sourceResolver';
 import {
   calculateCost,
   collectUsageDetailsWithEndpoint,
@@ -1485,7 +1485,7 @@ export function useMonitoringData({
       buildSourceInfoMap({
         geminiApiKeys: config?.geminiApiKeys || [],
         claudeApiKeys: config?.claudeApiKeys || [],
-        codexApiKeys: config?.codexApiKeys || [],
+        antigravityApiKeys: (config as Config & { antigravityApiKeys?: SourceInfoMapInput['antigravityApiKeys'] } | null | undefined)?.antigravityApiKeys || [],
         vertexApiKeys: config?.vertexApiKeys || [],
         openaiCompatibility: config?.openaiCompatibility || [],
       }),

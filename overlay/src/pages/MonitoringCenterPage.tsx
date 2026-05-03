@@ -29,22 +29,24 @@ import {
 import { useUsageData } from '@/features/monitoring/hooks/useUsageData';
 import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
 import { useInterval } from '@/hooks/useInterval';
-import { apiCallApi, getApiCallErrorMessage } from '@/services/api';
-import { useAuthStore, useConfigStore } from '@/stores';
-import type { AuthFileItem, CodexRateLimitInfo, CodexUsagePayload, CodexUsageWindow } from '@/types';
+import { useAuthStore, useConfigStore, useQuotaStore } from '@/stores';
+import type { AuthFileItem } from '@/types';
 import { maskSensitiveText } from '@/utils/format';
-import {
-  CODEX_REQUEST_HEADERS,
-  CODEX_USAGE_URL,
-  formatCodexResetLabel,
-  isCodexFile,
-  normalizeNumberValue,
-  normalizePlanType,
-  parseCodexUsagePayload,
-  resolveCodexChatgptAccountId,
-  resolveCodexPlanType,
-} from '@/utils/quota';
+import { getStatusFromError } from '@/utils/quota';
 import { formatCompactNumber, formatDurationMs, formatUsd, normalizeAuthIndex, type ModelPrice } from '@/utils/usage';
+import {
+  ANTIGRAVITY_CONFIG,
+  CLAUDE_CONFIG,
+  CODEX_CONFIG,
+  GEMINI_CLI_CONFIG,
+  KIMI_CONFIG,
+  type QuotaConfig,
+  type QuotaStore,
+} from '@/components/quota/quotaConfigs';
+import { QuotaProgressBar, type QuotaRenderHelpers, type QuotaStatusState } from '@/components/quota/QuotaCard';
+import { FEATURES } from '@/config/features';
+import { quotaPersistenceMiddleware } from '@/extensions/quota/persistenceMiddleware';
+import quotaStyles from '@/pages/QuotaPage.module.scss';
 import styles from './MonitoringCenterPage.module.scss';
 
 const TIME_RANGE_OPTIONS: Array<{ value: MonitoringTimeRange; labelKey: string }> = [
@@ -108,113 +110,6 @@ type RealtimeLogRow = MonitoringEventRow & {
   recentPattern: boolean[];
 };
 
-type AccountQuotaTarget = {
-  key: string;
-  authIndex: string;
-  authLabel: string;
-  fileName: string;
-  accountId: string | null;
-  planType: string | null;
-};
-
-type AccountQuotaWindow = {
-  id: string;
-  label: string;
-  remainingPercent: number | null;
-  resetLabel: string;
-};
-
-type AccountQuotaEntry = {
-  key: string;
-  authLabel: string;
-  fileName: string;
-  planType: string | null;
-  windows: AccountQuotaWindow[];
-  error?: string;
-};
-
-type AccountQuotaState = {
-  status: 'idle' | 'loading' | 'success' | 'error';
-  targetKey: string;
-  entries: AccountQuotaEntry[];
-  error?: string;
-  lastRefreshedAt?: number;
-};
-
-type AccountSortKey =
-  | 'totalCalls'
-  | 'successCalls'
-  | 'failureCalls'
-  | 'totalTokens'
-  | 'inputTokens'
-  | 'outputTokens'
-  | 'cachedTokens'
-  | 'totalCost'
-  | 'lastSeenAt';
-
-type AccountSortDirection = 'asc' | 'desc';
-
-type AccountSortState = {
-  key: AccountSortKey;
-  direction: AccountSortDirection;
-};
-
-type AccountOverviewColumn = {
-  key: string;
-  label: string;
-  sortKey?: AccountSortKey;
-};
-
-type AccountSummaryMetric = {
-  key: string;
-  label: string;
-  value: string;
-  valueClassName?: string;
-};
-
-const formatPercent = (value: number) => `${(value * 100).toFixed(1)}%`;
-
-const joinShort = (values: string[], limit = 2) => {
-  if (values.length <= limit) {
-    return values.join(', ');
-  }
-  return `${values.slice(0, limit).join(', ')} +${values.length - limit}`;
-};
-
-const createPriceDraft = (price?: ModelPrice): PriceDraft => ({
-  prompt: price ? String(price.prompt) : '',
-  completion: price ? String(price.completion) : '',
-  cache: price ? String(price.cache) : '',
-});
-
-const parsePriceValue = (value: string) => {
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
-};
-
-const formatPriceUnit = (value: number) => `$${value.toFixed(4)}/1M`;
-
-const buildRealtimeMetaText = (row: MonitoringEventRow) => {
-  const text = `${row.endpointMethod} ${row.endpointPath}`.trim();
-  return maskSensitiveText(text || '-');
-};
-
-const FIVE_HOUR_SECONDS = 18000;
-const WEEK_SECONDS = 604800;
-const PREMIUM_CODEX_PLAN_TYPES = new Set(['pro', 'prolite', 'pro-lite', 'pro_lite']);
-
-const getCodexPlanLabel = (planType: string | null | undefined, t: TFunction): string | null => {
-  const normalized = normalizePlanType(planType);
-  if (!normalized) return null;
-  if (normalized === 'pro') return t('codex_quota.plan_pro');
-  if (PREMIUM_CODEX_PLAN_TYPES.has(normalized) && normalized !== 'pro') {
-    return t('codex_quota.plan_prolite');
-  }
-  if (normalized === 'plus') return t('codex_quota.plan_plus');
-  if (normalized === 'team') return t('codex_quota.plan_team');
-  if (normalized === 'free') return t('codex_quota.plan_free');
-  return planType || normalized;
-};
 
 const buildAccountSecondaryText = (row: MonitoringAccountRow) => {
   const extraAuthLabels = row.authLabels.filter((label) => label && label !== row.account);
@@ -312,165 +207,142 @@ const compareAccountRowsByDefault = (left: MonitoringAccountRow, right: Monitori
   right.totalCost - left.totalCost ||
   left.account.localeCompare(right.account);
 
-const buildAccountQuotaWindows = (
-  payload: CodexUsagePayload,
-  t: TFunction
-): AccountQuotaWindow[] => {
-  const windows: AccountQuotaWindow[] = [];
-  const rateLimit = payload.rate_limit ?? payload.rateLimit ?? undefined;
-  const codeReviewLimit = payload.code_review_rate_limit ?? payload.codeReviewRateLimit ?? undefined;
-  const additionalRateLimits = payload.additional_rate_limits ?? payload.additionalRateLimits ?? [];
+type AnyQuotaConfig = QuotaConfig<any, any>;
 
-  const addWindow = (
-    id: string,
-    label: string,
-    window?: CodexUsageWindow | null,
-    limitReached?: boolean,
-    allowed?: boolean
-  ) => {
-    if (!window) return;
+type AccountQuotaTarget = {
+  key: string;
+  authIndex: string;
+  authLabel: string;
+  fileName: string;
+  file: AuthFileItem;
+  config: AnyQuotaConfig;
+};
 
-    const resetLabel = formatCodexResetLabel(window);
-    const usedPercentRaw = normalizeNumberValue(window.used_percent ?? window.usedPercent);
-    const isLimitReached = Boolean(limitReached) || allowed === false;
-    const usedPercent = usedPercentRaw ?? (isLimitReached && resetLabel !== '-' ? 100 : null);
-    const clampedUsed = usedPercent === null ? null : Math.max(0, Math.min(100, usedPercent));
-    const remainingPercent = clampedUsed === null ? null : Math.max(0, 100 - clampedUsed);
+type AccountQuotaEntry = {
+  key: string;
+  authLabel: string;
+  fileName: string;
+  providerLabel: string;
+  quota?: QuotaStatusState;
+  config: AnyQuotaConfig;
+};
 
-    windows.push({
-      id,
-      label,
-      remainingPercent,
-      resetLabel,
-    });
-  };
+type AccountQuotaState = {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  targetKey: string;
+  error?: string;
+  lastRefreshedAt?: number;
+};
 
-  const getWindowSeconds = (window?: CodexUsageWindow | null): number | null => {
-    if (!window) return null;
-    return normalizeNumberValue(window.limit_window_seconds ?? window.limitWindowSeconds);
-  };
+type AccountSortKey =
+  | 'totalCalls'
+  | 'successCalls'
+  | 'failureCalls'
+  | 'totalTokens'
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'cachedTokens'
+  | 'totalCost'
+  | 'lastSeenAt';
 
-  const pickClassifiedWindows = (
-    limitInfo?: CodexRateLimitInfo | null
-  ): { fiveHourWindow: CodexUsageWindow | null; weeklyWindow: CodexUsageWindow | null } => {
-    const primaryWindow = limitInfo?.primary_window ?? limitInfo?.primaryWindow ?? null;
-    const secondaryWindow = limitInfo?.secondary_window ?? limitInfo?.secondaryWindow ?? null;
-    const rawWindows = [primaryWindow, secondaryWindow];
+type AccountSortDirection = 'asc' | 'desc';
 
-    let fiveHourWindow: CodexUsageWindow | null = null;
-    let weeklyWindow: CodexUsageWindow | null = null;
+type AccountSortState = {
+  key: AccountSortKey;
+  direction: AccountSortDirection;
+};
 
-    rawWindows.forEach((window) => {
-      if (!window) return;
-      const seconds = getWindowSeconds(window);
-      if (seconds === FIVE_HOUR_SECONDS && !fiveHourWindow) {
-        fiveHourWindow = window;
-      } else if (seconds === WEEK_SECONDS && !weeklyWindow) {
-        weeklyWindow = window;
-      }
-    });
+type AccountOverviewColumn = {
+  key: string;
+  label: string;
+  sortKey?: AccountSortKey;
+};
 
-    if (!fiveHourWindow) {
-      fiveHourWindow = primaryWindow && primaryWindow !== weeklyWindow ? primaryWindow : null;
-    }
-    if (!weeklyWindow) {
-      weeklyWindow = secondaryWindow && secondaryWindow !== fiveHourWindow ? secondaryWindow : null;
-    }
+type AccountSummaryMetric = {
+  key: string;
+  label: string;
+  value: string;
+  valueClassName?: string;
+};
 
-    return { fiveHourWindow, weeklyWindow };
-  };
+const formatPercent = (value: number) => `${(value * 100).toFixed(1)}%`;
 
-  const rateLimitReached = rateLimit?.limit_reached ?? rateLimit?.limitReached;
-  const rateAllowed = rateLimit?.allowed;
-  const rateWindows = pickClassifiedWindows(rateLimit);
-  addWindow('five-hour', t('codex_quota.primary_window'), rateWindows.fiveHourWindow, rateLimitReached, rateAllowed);
-  addWindow('weekly', t('codex_quota.secondary_window'), rateWindows.weeklyWindow, rateLimitReached, rateAllowed);
-
-  const codeReviewLimitReached = codeReviewLimit?.limit_reached ?? codeReviewLimit?.limitReached;
-  const codeReviewAllowed = codeReviewLimit?.allowed;
-  const codeReviewWindows = pickClassifiedWindows(codeReviewLimit);
-  addWindow(
-    'code-review-five-hour',
-    t('codex_quota.code_review_primary_window'),
-    codeReviewWindows.fiveHourWindow,
-    codeReviewLimitReached,
-    codeReviewAllowed
-  );
-  addWindow(
-    'code-review-weekly',
-    t('codex_quota.code_review_secondary_window'),
-    codeReviewWindows.weeklyWindow,
-    codeReviewLimitReached,
-    codeReviewAllowed
-  );
-
-  if (Array.isArray(additionalRateLimits)) {
-    additionalRateLimits.forEach((limitItem, index) => {
-      const rateInfo = limitItem?.rate_limit ?? limitItem?.rateLimit ?? null;
-      if (!rateInfo) return;
-
-      const limitName =
-        limitItem?.limit_name ??
-        limitItem?.limitName ??
-        limitItem?.metered_feature ??
-        limitItem?.meteredFeature ??
-        `additional-${index + 1}`;
-      const limitLabel = String(limitName).trim() || `additional-${index + 1}`;
-
-      addWindow(
-        `${limitLabel}-primary-${index}`,
-        t('codex_quota.additional_primary_window', { name: limitLabel }),
-        rateInfo.primary_window ?? rateInfo.primaryWindow ?? null,
-        rateInfo.limit_reached ?? rateInfo.limitReached,
-        rateInfo.allowed
-      );
-      addWindow(
-        `${limitLabel}-secondary-${index}`,
-        t('codex_quota.additional_secondary_window', { name: limitLabel }),
-        rateInfo.secondary_window ?? rateInfo.secondaryWindow ?? null,
-        rateInfo.limit_reached ?? rateInfo.limitReached,
-        rateInfo.allowed
-      );
-    });
+const joinShort = (values: string[], limit = 2) => {
+  if (values.length <= limit) {
+    return values.join(', ');
   }
+  return `${values.slice(0, limit).join(', ')} +${values.length - limit}`;
+};
 
-  return windows;
+const createPriceDraft = (price?: ModelPrice): PriceDraft => ({
+  prompt: price ? String(price.prompt) : '',
+  completion: price ? String(price.completion) : '',
+  cache: price ? String(price.cache) : '',
+});
+
+const parsePriceValue = (value: string) => {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+};
+
+const formatPriceUnit = (value: number) => `$${value.toFixed(4)}/1M`;
+
+const buildRealtimeMetaText = (row: MonitoringEventRow) => {
+  const text = `${row.endpointMethod} ${row.endpointPath}`.trim();
+  return maskSensitiveText(text || '-');
+};
+
+const QUOTA_CONFIGS: AnyQuotaConfig[] = [
+  ANTIGRAVITY_CONFIG,
+  CLAUDE_CONFIG,
+  CODEX_CONFIG,
+  GEMINI_CLI_CONFIG,
+  KIMI_CONFIG,
+] as AnyQuotaConfig[];
+
+const QUOTA_RENDER_HELPERS: QuotaRenderHelpers = {
+  styles: quotaStyles,
+  QuotaProgressBar,
+};
+
+const getQuotaProviderLabel = (config: AnyQuotaConfig, t: TFunction) => {
+  const titleKey = `${config.i18nPrefix}.title`;
+  const translated = t(titleKey);
+  if (translated !== titleKey) return translated;
+  return config.type;
+};
+
+const resolveQuotaErrorMessage = (t: TFunction, quota?: QuotaStatusState): string => {
+  if (!quota) return t('common.unknown_error');
+  if (quota.errorStatus === 404) return t('common.quota_update_required');
+  if (quota.errorStatus === 403) return t('common.quota_check_credential');
+  return quota.error || t('common.unknown_error');
+};
+
+const hasUsableQuotaContent = (quota?: QuotaStatusState) => {
+  if (!quota || quota.status !== 'success') return false;
+  const record = quota as unknown as Record<string, unknown>;
+  return ['groups', 'windows', 'buckets', 'rows'].some((key) => {
+    const value = record[key];
+    return Array.isArray(value) && value.length > 0;
+  }) || Boolean(record.planType || record.tierLabel || record.creditBalance !== undefined);
+};
+
+const getQuotaForTarget = (store: QuotaStore, target: AccountQuotaTarget): QuotaStatusState | undefined => {
+  return target.config.storeSelector(store)[target.fileName] as QuotaStatusState | undefined;
 };
 
 const requestAccountQuota = async (
   target: AccountQuotaTarget,
   t: TFunction
-): Promise<AccountQuotaEntry> => {
-  if (!target.accountId) {
-    throw new Error(t('codex_quota.missing_account_id'));
+): Promise<QuotaStatusState> => {
+  try {
+    const data = await target.config.fetchQuota(target.file, t);
+    return target.config.buildSuccessState(data) as QuotaStatusState;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : t('common.unknown_error');
+    return target.config.buildErrorState(message, getStatusFromError(err)) as QuotaStatusState;
   }
-
-  const result = await apiCallApi.request({
-    authIndex: target.authIndex,
-    method: 'GET',
-    url: CODEX_USAGE_URL,
-    header: {
-      ...CODEX_REQUEST_HEADERS,
-      'Chatgpt-Account-Id': target.accountId,
-    },
-  });
-
-  if (result.statusCode < 200 || result.statusCode >= 300) {
-    throw new Error(getApiCallErrorMessage(result));
-  }
-
-  const payload = parseCodexUsagePayload(result.body ?? result.bodyText);
-  if (!payload) {
-    throw new Error(t('codex_quota.empty_windows'));
-  }
-
-  return {
-    key: target.key,
-    authLabel: target.authLabel,
-    fileName: target.fileName,
-    planType: normalizePlanType(payload.plan_type ?? payload.planType) ?? target.planType,
-    windows: buildAccountQuotaWindows(payload, t),
-  };
 };
 
 const buildRealtimeLogRows = (rows: MonitoringEventRow[]): RealtimeLogRow[] => {
@@ -597,6 +469,7 @@ function ModelSpendTable({
   locale,
   t,
   quotaState,
+  quotaEntries,
   onRefreshQuota,
 }: {
   row: MonitoringAccountRow;
@@ -604,45 +477,14 @@ function ModelSpendTable({
   locale: string;
   t: TFunction;
   quotaState?: AccountQuotaState;
+  quotaEntries: AccountQuotaEntry[];
   onRefreshQuota: () => void;
 }) {
-  const quotaEntries = quotaState?.entries ?? [];
   const quotaLoading = quotaState?.status === 'loading';
   const lastQuotaSync =
     quotaState?.lastRefreshedAt && Number.isFinite(quotaState.lastRefreshedAt)
       ? new Date(quotaState.lastRefreshedAt).toLocaleString(locale)
       : '';
-  const singleQuotaEntry = quotaEntries.length === 1 ? quotaEntries[0] : null;
-  const singlePlanLabel = singleQuotaEntry ? getCodexPlanLabel(singleQuotaEntry.planType, t) : null;
-  const quotaMetaText = [singlePlanLabel ? `${t('codex_quota.plan_label')}: ${singlePlanLabel}` : '', lastQuotaSync ? `${t('monitoring.last_sync')}: ${lastQuotaSync}` : '']
-    .filter(Boolean)
-    .join(' · ');
-
-  const renderQuotaWindows = (windows: AccountQuotaWindow[]) => (
-    <div className={styles.quotaWindowList}>
-      {windows.map((window) => {
-        const percentLabel =
-          window.remainingPercent === null ? '--' : `${Math.round(window.remainingPercent)}%`;
-        const barStyle =
-          window.remainingPercent === null
-            ? undefined
-            : { width: `${Math.max(0, Math.min(100, window.remainingPercent))}%` };
-
-        return (
-          <div key={window.id} className={styles.quotaWindowRow}>
-            <div className={styles.quotaWindowHeader}>
-              <span>{window.label}</span>
-              <strong>{percentLabel}</strong>
-            </div>
-            <div className={styles.quotaProgressTrack}>
-              <span className={styles.quotaProgressBar} style={barStyle} />
-            </div>
-            <small>{`${t('monitoring.account_quota_reset_at')}: ${window.resetLabel}`}</small>
-          </div>
-        );
-      })}
-    </div>
-  );
 
   const renderRefreshButton = () => (
     <button
@@ -676,26 +518,7 @@ function ModelSpendTable({
           <div className={styles.quotaStateMessage}>{t('monitoring.account_quota_empty')}</div>
         ) : null}
 
-        {singleQuotaEntry ? (
-          singleQuotaEntry.error ? (
-            <div className={styles.quotaStateMessage}>
-              {t('codex_quota.load_failed', { message: singleQuotaEntry.error })}
-            </div>
-          ) : singleQuotaEntry.windows.length > 0 ? (
-            <div className={styles.quotaCompactCard}>
-              <div className={styles.quotaCompactHeader}>
-                <div className={styles.quotaSectionTitleGroup}>
-                  <strong>{t('codex_quota.title')}</strong>
-                  {quotaMetaText ? <span>{quotaMetaText}</span> : null}
-                </div>
-                {renderRefreshButton()}
-              </div>
-              {renderQuotaWindows(singleQuotaEntry.windows)}
-            </div>
-          ) : (
-            <div className={styles.quotaStateMessage}>{t('codex_quota.empty_windows')}</div>
-          )
-        ) : quotaEntries.length > 0 ? (
+        {quotaEntries.length > 0 ? (
           <>
             <div className={styles.quotaSectionHeader}>
               <div className={styles.quotaSectionTitleGroup}>
@@ -705,33 +528,32 @@ function ModelSpendTable({
               {renderRefreshButton()}
             </div>
             <div className={styles.quotaEntryGrid}>
-              {quotaEntries.map((entry) => {
-                const planLabel = getCodexPlanLabel(entry.planType, t);
-                return (
-                  <div key={entry.key} className={styles.quotaEntryCard}>
-                    <div className={styles.quotaEntryHeader}>
-                      <div className={styles.quotaEntryMain}>
-                        <strong>{entry.authLabel}</strong>
-                        <small>
-                          {planLabel
-                            ? `${t('codex_quota.plan_label')}: ${planLabel}`
-                            : entry.fileName}
-                        </small>
-                      </div>
+              {quotaEntries.map((entry) => (
+                <div key={entry.key} className={styles.quotaEntryCard}>
+                  <div className={styles.quotaEntryHeader}>
+                    <div className={styles.quotaEntryMain}>
+                      <strong>{entry.authLabel}</strong>
+                      <small>{`${entry.providerLabel} · ${entry.fileName}`}</small>
                     </div>
-
-                    {entry.error ? (
-                      <div className={styles.quotaStateMessage}>
-                        {t('codex_quota.load_failed', { message: entry.error })}
-                      </div>
-                    ) : entry.windows.length > 0 ? (
-                      renderQuotaWindows(entry.windows)
-                    ) : (
-                      <div className={styles.quotaStateMessage}>{t('codex_quota.empty_windows')}</div>
-                    )}
                   </div>
-                );
-              })}
+
+                  {entry.quota?.status === 'loading' ? (
+                    <div className={styles.quotaStateMessage}>{t(`${entry.config.i18nPrefix}.loading`)}</div>
+                  ) : entry.quota?.status === 'error' ? (
+                    <div className={styles.quotaStateMessage}>
+                      {t(`${entry.config.i18nPrefix}.load_failed`, {
+                        message: resolveQuotaErrorMessage(t, entry.quota),
+                      })}
+                    </div>
+                  ) : hasUsableQuotaContent(entry.quota) ? (
+                    <div className={quotaStyles.quotaSection}>
+                      {entry.config.renderQuotaItems(entry.quota!, t, QUOTA_RENDER_HELPERS)}
+                    </div>
+                  ) : (
+                    <div className={styles.quotaStateMessage}>{t(`${entry.config.i18nPrefix}.idle`)}</div>
+                  )}
+                </div>
+              ))}
             </div>
           </>
         ) : null}
@@ -791,6 +613,7 @@ function ExpandedAccountCard({
   summaryMetrics,
   isFocused,
   quotaState,
+  quotaEntries,
   onToggle,
   onFocus,
   onRefreshQuota,
@@ -802,6 +625,7 @@ function ExpandedAccountCard({
   summaryMetrics: AccountSummaryMetric[];
   isFocused: boolean;
   quotaState?: AccountQuotaState;
+  quotaEntries: AccountQuotaEntry[];
   onToggle: () => void;
   onFocus: () => void;
   onRefreshQuota: () => void;
@@ -831,6 +655,7 @@ function ExpandedAccountCard({
           locale={locale}
           t={t}
           quotaState={quotaState}
+          quotaEntries={quotaEntries}
           onRefreshQuota={onRefreshQuota}
         />
       </div>
@@ -842,6 +667,7 @@ export function MonitoringCenterPage() {
   const { t, i18n } = useTranslation();
   const config = useConfigStore((state) => state.config);
   const connectionStatus = useAuthStore((state) => state.connectionStatus);
+  const quotaStore = useQuotaStore((state) => state);
   const [timeRange, setTimeRange] = useState<MonitoringTimeRange>('today');
   const [searchInput, setSearchInput] = useState('');
   const [autoRefreshMs, setAutoRefreshMs] = useState('5000');
@@ -905,6 +731,20 @@ export function MonitoringCenterPage() {
   useEffect(() => {
     accountQuotaStatesRef.current = accountQuotaStates;
   }, [accountQuotaStates]);
+
+  useEffect(() => {
+    if (!FEATURES.QUOTA_PERSISTENCE) return;
+    quotaPersistenceMiddleware.start();
+    return () => quotaPersistenceMiddleware.stop();
+  }, []);
+
+  const setQuotaForConfig = useCallback(
+    (quotaConfig: AnyQuotaConfig, updater: Record<string, QuotaStatusState> | ((prev: Record<string, QuotaStatusState>) => Record<string, QuotaStatusState>)) => {
+      const setter = useQuotaStore.getState()[quotaConfig.storeSetter] as (value: typeof updater) => void;
+      setter(updater);
+    },
+    []
+  );
 
   const providerOptions = useMemo(
     () => [
@@ -1031,9 +871,12 @@ export function MonitoringCenterPage() {
       if (!authIndex || !row.account) return;
 
       const file = authFilesByAuthIndex.get(authIndex);
-      if (!file || !isCodexFile(file)) return;
+      if (!file) return;
 
-      const dedupeKey = `${authIndex}::${file.name}`;
+      const quotaConfig = QUOTA_CONFIGS.find((item) => item.filterFn(file));
+      if (!quotaConfig) return;
+
+      const dedupeKey = `${quotaConfig.type}::${authIndex}::${file.name}`;
       const bucket = grouped.get(row.account) ?? new Map<string, AccountQuotaTarget>();
       if (!bucket.has(dedupeKey)) {
         bucket.set(dedupeKey, {
@@ -1041,8 +884,8 @@ export function MonitoringCenterPage() {
           authIndex,
           authLabel: row.authLabel || file.name || authIndex,
           fileName: file.name,
-          accountId: resolveCodexChatgptAccountId(file),
-          planType: resolveCodexPlanType(file),
+          file,
+          config: quotaConfig,
         });
       }
       grouped.set(row.account, bucket);
@@ -1055,6 +898,21 @@ export function MonitoringCenterPage() {
       ])
     );
   }, [authFilesByAuthIndex, scopedRows]);
+  const accountQuotaEntriesByAccount = useMemo(() => {
+    return new Map(
+      Array.from(accountQuotaTargetsByAccount.entries()).map(([account, targets]) => [
+        account,
+        targets.map((target) => ({
+          key: target.key,
+          authLabel: target.authLabel,
+          fileName: target.fileName,
+          providerLabel: getQuotaProviderLabel(target.config, t),
+          quota: getQuotaForTarget(quotaStore, target),
+          config: target.config,
+        } satisfies AccountQuotaEntry)),
+      ])
+    );
+  }, [accountQuotaTargetsByAccount, quotaStore, t]);
   const scopedFailureCount = scopedRows.filter((row) => row.failed).length;
   const savedPriceEntries = useMemo(
     () => Object.entries(modelPrices).sort((left, right) => left[0].localeCompare(right[0])),
@@ -1186,7 +1044,6 @@ export function MonitoringCenterPage() {
         [account]: {
           status: 'loading',
           targetKey,
-          entries: previous[account]?.targetKey === targetKey ? previous[account]?.entries ?? [] : [],
           lastRefreshedAt: previous[account]?.lastRefreshedAt,
         },
       }));
@@ -1198,47 +1055,52 @@ export function MonitoringCenterPage() {
           [account]: {
             status: 'success',
             targetKey,
-            entries: [],
             lastRefreshedAt: Date.now(),
           },
         }));
         return;
       }
 
+      targets.forEach((target) => {
+        setQuotaForConfig(target.config, (prev) => ({
+          ...prev,
+          [target.fileName]: target.config.buildLoadingState(),
+        }));
+      });
+
       const settled = await Promise.allSettled(targets.map((target) => requestAccountQuota(target, t)));
       if (accountQuotaRequestIdsRef.current[account] !== requestId) return;
 
-      const entries = settled.map((result, index) => {
-        const fallback = targets[index];
-        if (result.status === 'fulfilled') {
-          return result.value;
-        }
+      settled.forEach((result, index) => {
+        const target = targets[index];
+        const quota = result.status === 'fulfilled'
+          ? result.value
+          : target.config.buildErrorState(
+              result.reason instanceof Error ? result.reason.message : String(result.reason || t('common.unknown_error')),
+              getStatusFromError(result.reason)
+            ) as QuotaStatusState;
 
-        const error =
-          result.reason instanceof Error ? result.reason.message : String(result.reason || t('common.unknown_error'));
-        return {
-          key: fallback.key,
-          authLabel: fallback.authLabel,
-          fileName: fallback.fileName,
-          planType: fallback.planType,
-          windows: [],
-          error,
-        } satisfies AccountQuotaEntry;
+        setQuotaForConfig(target.config, (prev) => ({
+          ...prev,
+          [target.fileName]: quota,
+        }));
       });
 
-      const hasSuccess = entries.some((entry) => !entry.error);
+      const currentStore = useQuotaStore.getState();
+      const entries = targets.map((target) => getQuotaForTarget(currentStore, target)).filter(Boolean) as QuotaStatusState[];
+      const hasSuccess = entries.some((entry) => entry.status === 'success');
+      const firstError = entries.find((entry) => entry.status === 'error')?.error;
       setAccountQuotaStates((previous) => ({
         ...previous,
         [account]: {
           status: hasSuccess ? 'success' : 'error',
           targetKey,
-          entries,
-          error: hasSuccess ? '' : entries[0]?.error || t('common.unknown_error'),
+          error: hasSuccess ? '' : firstError || t('common.unknown_error'),
           lastRefreshedAt: Date.now(),
         },
       }));
     },
-    [accountQuotaTargetsByAccount, t]
+    [accountQuotaTargetsByAccount, setQuotaForConfig, t]
   );
 
   const toggleAccountExpanded = useCallback((accountId: string, account: string) => {
@@ -1597,6 +1459,7 @@ export function MonitoringCenterPage() {
                           summaryMetrics={summaryMetrics}
                           isFocused={isFocused}
                           quotaState={accountQuotaStates[row.account]}
+                          quotaEntries={accountQuotaEntriesByAccount.get(row.account) ?? []}
                           onToggle={() => toggleAccountExpanded(row.id, row.account)}
                           onFocus={() => focusAccount(row.account)}
                           onRefreshQuota={() => void loadAccountQuota(row.account, true)}

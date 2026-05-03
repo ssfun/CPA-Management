@@ -6,6 +6,7 @@ export interface SourceInfoMapInput {
   geminiApiKeys?: GeminiKeyConfig[];
   claudeApiKeys?: ProviderKeyConfig[];
   codexApiKeys?: ProviderKeyConfig[];
+  antigravityApiKeys?: ProviderKeyConfig[];
   vertexApiKeys?: ProviderKeyConfig[];
   openaiCompatibility?: OpenAIProviderConfig[];
 }
@@ -67,6 +68,7 @@ export function buildSourceInfoMap(input: SourceInfoMapInput): SourceInfoMap {
     { items: input.geminiApiKeys || [], type: 'gemini', label: 'Gemini' },
     { items: input.claudeApiKeys || [], type: 'claude', label: 'Claude' },
     { items: input.codexApiKeys || [], type: 'codex', label: 'Codex' },
+    { items: input.antigravityApiKeys || [], type: 'antigravity', label: 'Antigravity' },
     { items: input.vertexApiKeys || [], type: 'vertex', label: 'Vertex' },
   ];
 
