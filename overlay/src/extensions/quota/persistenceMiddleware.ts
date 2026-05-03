@@ -1,10 +1,10 @@
 /**
  * Zustand persistence middleware for quota data.
- * Automatically syncs quota state to IndexedDB.
+ * Automatically syncs quota state to SQLite quota cache.
  */
 
 import { useQuotaStore } from '@/stores';
-import { indexedDBQuotaCache } from './indexedDBCache';
+import { sqliteQuotaCache } from './sqliteQuotaCache';
 
 type QuotaProviderType = 'antigravity' | 'claude' | 'codex' | 'gemini-cli' | 'kimi';
 
@@ -99,7 +99,7 @@ class QuotaPersistenceMiddleware {
   }
 
   /**
-   * Sync provider quota to IndexedDB (debounced)
+   * Sync provider quota to SQLite quota cache (debounced)
    */
   private syncProvider(
     provider: QuotaProviderType,
@@ -122,7 +122,7 @@ class QuotaPersistenceMiddleware {
   }
 
   /**
-   * Flush sync queue to IndexedDB
+   * Flush sync queue to SQLite quota cache
    */
   private async flushSyncQueue() {
     if (this.syncQueue.size === 0) return;
@@ -137,7 +137,7 @@ class QuotaPersistenceMiddleware {
 
       if (quotaState?.status === 'success' && quotaState.cachedAt) {
         promises.push(
-          indexedDBQuotaCache.set(provider, fileName, quotaState, quotaState.cachedAt)
+          sqliteQuotaCache.set(provider, fileName, quotaState, quotaState.cachedAt)
         );
       }
     });
@@ -147,12 +147,12 @@ class QuotaPersistenceMiddleware {
     try {
       await Promise.all(promises);
     } catch (err) {
-      console.error('QuotaPersistenceMiddleware: Failed to sync to IndexedDB:', err);
+      console.error('QuotaPersistenceMiddleware: Failed to sync to SQLite quota cache:', err);
     }
   }
 
   /**
-   * Preload cache from IndexedDB to Zustand store
+   * Preload cache from SQLite quota cache to Zustand store
    */
   private async preloadCache() {
     this.isPreloading = true;
@@ -171,16 +171,16 @@ class QuotaPersistenceMiddleware {
   }
 
   /**
-   * Preload single provider from IndexedDB
+   * Preload single provider from SQLite quota cache
    */
   private async preloadProvider(provider: QuotaProviderType) {
     try {
       // Get all cached file names for this provider
-      const fileNames = await indexedDBQuotaCache.getFileNamesByProvider(provider);
+      const fileNames = await sqliteQuotaCache.getFileNamesByProvider(provider);
       if (fileNames.length === 0) return;
 
       // Batch get cached data
-      const cached = await indexedDBQuotaCache.batchGet(provider, fileNames);
+      const cached = await sqliteQuotaCache.batchGet(provider, fileNames);
       if (cached.size === 0) return;
 
       // Write to store
@@ -250,14 +250,14 @@ class QuotaPersistenceMiddleware {
    * Get cache statistics
    */
   async getStats() {
-    return await indexedDBQuotaCache.getStats();
+    return await sqliteQuotaCache.getStats();
   }
 
   /**
    * Clear all cache
    */
   async clearCache() {
-    await indexedDBQuotaCache.clear();
+    await sqliteQuotaCache.clear();
     console.log('QuotaPersistenceMiddleware: Cache cleared');
   }
 }

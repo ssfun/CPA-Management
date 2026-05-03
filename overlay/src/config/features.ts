@@ -4,8 +4,8 @@
 
 export const FEATURES = {
   /**
-   * Enable IndexedDB persistence for quota data.
-   * When enabled, quota data survives page refresh.
+   * Enable SQLite-backed persistence for quota data.
+   * When enabled, quota data survives page refresh and browser changes.
    */
   QUOTA_PERSISTENCE: true,
 
